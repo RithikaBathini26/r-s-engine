@@ -1,64 +1,78 @@
 import streamlit as st
 import os
+
+# ------------------ PAGE CONFIG ------------------
+st.set_page_config(page_title="My Notes AI", layout="wide")
+st.title("📚 My Personal Notes AI Assistant")
+
+# ------------------ LOAD SECRET KEY ------------------
 groq_key = st.secrets["GROQ_API_KEY"]
 
-from dotenv import load_dotenv
-load_dotenv()
-
+# ------------------ IMPORTS ------------------
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 
+# ------------------ CACHE HEAVY COMPONENTS ------------------
 
-st.set_page_config(page_title="My Notes AI", layout="wide")
+@st.cache_resource
+def load_embeddings():
+    return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
-st.title("📚 My Personal Notes AI Assistant")
+@st.cache_resource
+def load_vector_db():
+    return FAISS.load_local(
+        "vector_db",
+        load_embeddings(),
+        allow_dangerous_deserialization=True
+    )
 
-# -------- LOAD EMBEDDINGS --------
-embeddings = HuggingFaceEmbeddings(
-    model_name="all-MiniLM-L6-v2"
-)
+@st.cache_resource
+def load_llm():
+    return ChatGroq(
+        model="llama-3.1-8b-instant",
+        temperature=0,
+        groq_api_key=groq_key
+    )
 
-# -------- LOAD VECTOR DB --------
-db = FAISS.load_local(
-    "vector_db",
-    embeddings,
-    allow_dangerous_deserialization=True
-)
+embeddings = load_embeddings()
+db = load_vector_db()
+llm = load_llm()
 
-# -------- LOAD LLM (Groq) --------
-llm = ChatGroq(
-    model="llama-3.1-8b-instant",
-    temperature=0
-)
+# ------------------ SESSION STATE ------------------
 
-# -------- SESSION STATE --------
 if "conversations" not in st.session_state:
     st.session_state.conversations = {}
 
 if "current_chat" not in st.session_state:
     st.session_state.current_chat = None
 
+# ------------------ SIDEBAR ------------------
 
-# -------- SIDEBAR --------
 st.sidebar.title("💬 Chat History")
 
-# New Chat Button
+# New Chat
 if st.sidebar.button("➕ New Chat"):
     st.session_state.current_chat = None
+
+# Clear Current Chat
+if st.sidebar.button("🗑 Clear Current Chat"):
+    if st.session_state.current_chat:
+        st.session_state.conversations[st.session_state.current_chat] = []
+        st.rerun()
 
 # Show Previous Chats
 for chat_title in st.session_state.conversations.keys():
     if st.sidebar.button(chat_title):
         st.session_state.current_chat = chat_title
 
+# ------------------ CHAT INPUT ------------------
 
-# -------- MAIN CHAT INPUT --------
-user_input = st.text_input("Ask something from your notes:")
+user_input = st.chat_input("Ask something from your notes...")
 
 if user_input:
 
-    # If first message → create new chat
+    # Create new chat if first message
     if st.session_state.current_chat is None:
         chat_title = user_input[:30]
         st.session_state.conversations[chat_title] = []
@@ -66,39 +80,51 @@ if user_input:
 
     chat = st.session_state.conversations[st.session_state.current_chat]
 
+    # Add user message
     chat.append(("You", user_input))
 
-    # Retrieve relevant docs
+    # ------------------ RETRIEVE CONTEXT ------------------
     docs = db.similarity_search(user_input, k=3)
-    context = "\n".join([doc.page_content for doc in docs])
+    context = "\n\n".join([doc.page_content for doc in docs])
 
-    # Build conversation history
+    # ------------------ BUILD HISTORY ------------------
     history_text = ""
     for role, message in chat:
         history_text += f"{role}: {message}\n"
 
+    # ------------------ PROMPT ------------------
     prompt = f"""
-You are a helpful assistant. Use ONLY the provided context to answer.
+You are a helpful AI assistant.
 
-Context:
+Use ONLY the provided context to answer.
+If the answer is not in the context, say:
+"I could not find this information in your notes."
+
+---------------------
+CONTEXT:
 {context}
+---------------------
 
-Conversation:
+CONVERSATION HISTORY:
 {history_text}
 
-Answer clearly and concisely:
+Now answer clearly and concisely:
 """
 
+    # ------------------ LLM RESPONSE ------------------
     response = llm.invoke(prompt).content
 
     chat.append(("Assistant", response))
 
+# ------------------ DISPLAY CHAT ------------------
 
-# -------- DISPLAY CHAT --------
 if st.session_state.current_chat:
     chat = st.session_state.conversations[st.session_state.current_chat]
+
     for role, message in chat:
         if role == "You":
-            st.markdown(f"**🧑 {role}:** {message}")
+            with st.chat_message("user"):
+                st.markdown(message)
         else:
-            st.markdown(f"**🤖 {role}:** {message}")
+            with st.chat_message("assistant"):
+                st.markdown(message)
