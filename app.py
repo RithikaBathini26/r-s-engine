@@ -1,70 +1,131 @@
 import streamlit as st
-import json
 import os
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.schema import HumanMessage, AIMessage
 
-# ========== FILE TO STORE CHAT HISTORY ==========
-CHAT_HISTORY_FILE = "chat_history.json"
+# ------------------ PAGE CONFIG ------------------
+st.set_page_config(page_title="My Notes AI", layout="wide")
+st.title("📚 My Personal Notes AI Assistant")
 
-# ========== LOAD CHAT HISTORY ==========
-def load_chat_history():
-    if os.path.exists(CHAT_HISTORY_FILE):
-        with open(CHAT_HISTORY_FILE, "r") as file:
-            return json.load(file)
-    return []
+# ------------------ LOAD SECRET KEY ------------------
+groq_key = st.secrets["GROQ_API_KEY"]
 
-# ========== SAVE CHAT HISTORY ==========
-def save_chat_history(history):
-    with open(CHAT_HISTORY_FILE, "w") as file:
-        json.dump(history, file)
+# ------------------ IMPORTS ------------------
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_groq import ChatGroq
 
-# ========== STREAMLIT PAGE ==========
-st.set_page_config(page_title="My Notes AI", page_icon="🤖")
-st.title("My Notes AI 🤖")
+# ------------------ CACHE HEAVY COMPONENTS ------------------
 
-# Load history from file
-if "messages" not in st.session_state:
-    st.session_state.messages = load_chat_history()
+@st.cache_resource
+def load_embeddings():
+    return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
-# Display previous messages
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+@st.cache_resource
+def load_vector_db():
+    return FAISS.load_local(
+        "vector_db",
+        load_embeddings(),
+        allow_dangerous_deserialization=True
+    )
 
-# Initialize Gemini model
-llm = ChatGoogleGenerativeAI(
-    model="gemini-1.5-flash",
-    google_api_key="YOUR_GOOGLE_API_KEY"
-)
+@st.cache_resource
+def load_llm():
+    return ChatGroq(
+        model="llama-3.1-8b-instant",
+        temperature=0,
+        groq_api_key=groq_key
+    )
 
-# User input
-if prompt := st.chat_input("Ask something..."):
-    
-    # Show user message
-    st.chat_message("user").markdown(prompt)
-    st.session_state.messages.append({"role": "user", "content": prompt})
+embeddings = load_embeddings()
+db = load_vector_db()
+llm = load_llm()
 
-    # Convert history to LangChain format
-    chat_history = []
-    for msg in st.session_state.messages:
-        if msg["role"] == "user":
-            chat_history.append(HumanMessage(content=msg["content"]))
+# ------------------ SESSION STATE ------------------
+
+if "conversations" not in st.session_state:
+    st.session_state.conversations = {}
+
+if "current_chat" not in st.session_state:
+    st.session_state.current_chat = None
+
+# ------------------ SIDEBAR ------------------
+
+st.sidebar.title("💬 Chat History")
+
+# New Chat
+if st.sidebar.button("➕ New Chat"):
+    st.session_state.current_chat = None
+
+# Clear Current Chat
+if st.sidebar.button("🗑 Clear Current Chat"):
+    if st.session_state.current_chat:
+        st.session_state.conversations[st.session_state.current_chat] = []
+        st.rerun()
+
+# Show Previous Chats
+for chat_title in st.session_state.conversations.keys():
+    if st.sidebar.button(chat_title):
+        st.session_state.current_chat = chat_title
+
+# ------------------ CHAT INPUT ------------------
+
+user_input = st.chat_input("Ask something from your notes...")
+
+if user_input:
+
+    # Create new chat if first message
+    if st.session_state.current_chat is None:
+        chat_title = user_input[:30]
+        st.session_state.conversations[chat_title] = []
+        st.session_state.current_chat = chat_title
+
+    chat = st.session_state.conversations[st.session_state.current_chat]
+
+    # Add user message
+    chat.append(("You", user_input))
+
+    # ------------------ RETRIEVE CONTEXT ------------------
+    docs = db.similarity_search(user_input, k=3)
+    context = "\n\n".join([doc.page_content for doc in docs])
+
+    # ------------------ BUILD HISTORY ------------------
+    history_text = ""
+    for role, message in chat:
+        history_text += f"{role}: {message}\n"
+
+    # ------------------ PROMPT ------------------
+    prompt = f"""
+You are a helpful AI assistant.
+
+Use ONLY the provided context to answer.
+If the answer is not in the context, say:
+"I could not find this information in your notes."
+
+---------------------
+CONTEXT:
+{context}
+---------------------
+
+CONVERSATION HISTORY:
+{history_text}
+
+Now answer clearly and concisely:
+"""
+
+    # ------------------ LLM RESPONSE ------------------
+    response = llm.invoke(prompt).content
+
+    chat.append(("Assistant", response))
+
+# ------------------ DISPLAY CHAT ------------------
+
+if st.session_state.current_chat:
+    chat = st.session_state.conversations[st.session_state.current_chat]
+
+    for role, message in chat:
+        if role == "You":
+            with st.chat_message("user"):
+                st.markdown(message)
         else:
-            chat_history.append(AIMessage(content=msg["content"]))
+            with st.chat_message("assistant"):
+                st.markdown(message)
 
-    # Get AI response
-    response = llm(chat_history)
-
-    # Show AI message
-    st.chat_message("assistant").markdown(response.content)
-    st.session_state.messages.append({"role": "assistant", "content": response.content})
-
-    # Save to file
-    save_chat_history(st.session_state.messages)
-
-# Clear chat button
-if st.button("Clear Chat"):
-    st.session_state.messages = []
-    save_chat_history([])
-    st.rerun()
